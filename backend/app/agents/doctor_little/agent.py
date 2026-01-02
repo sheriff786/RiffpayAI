@@ -1,6 +1,8 @@
+# from ast import List
 import base64
 from datetime import datetime
-from typing import Dict
+import re
+from typing import Dict, List
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
@@ -9,78 +11,7 @@ from .state import MedicalConsultationState, UrgencyLevel
 from .workflow import build_workflow
 from .tools import DoctorLittleTools
 from . import prompts
-
-
-# class DoctorLittleAgent:
-
-#     def __init__(self):
-#         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-#         self.workflow = self._build_workflow()
-
-#     # ---------- CORE LOGIC ----------
-
-#     async def extract_entities(self, text: str) -> Dict:
-#         prompt = f"""
-#         Extract medical entities from text and return JSON:
-#         Text: {text}
-#         """
-#         print("chat gpt is triggeresd")
-#         resp = await self.llm.ainvoke(prompt)
-#         print("chat response is ",resp)
-#         return {"raw": resp.content}
-
-#     async def assess_risk(self, entities: Dict) -> Dict:
-#         return {
-#             "risk_level": "medium",
-#             "confidence": 0.8
-#         }
-
-#     async def generate_soap(self, entities: Dict, risk: Dict) -> Dict:
-#         return {
-#             "SOAP": f"Assessment based on {entities}"
-#         }
-
-#     # ---------- LANGGRAPH ----------
-
-#     def _build_workflow(self):
-#         graph = StateGraph(MedicalConsultationState)
-
-#         graph.add_node("entity", self._entity_node)
-#         graph.add_node("risk", self._risk_node)
-#         graph.add_node("soap", self._soap_node)
-
-#         graph.add_edge(START, "entity")
-#         graph.add_edge("entity", "risk")
-#         graph.add_edge("risk", "soap")
-#         graph.add_edge("soap", END)
-
-#         return graph.compile()
-
-#     async def _entity_node(self, state):
-#         state["medical_entities"] = await self.extract_entities(state["text_input"])
-#         return state
-
-#     async def _risk_node(self, state):
-#         state["risk_assessment"] = await self.assess_risk(state["medical_entities"])
-#         return state
-
-#     async def _soap_node(self, state):
-#         state["structured_note"] = await self.generate_soap(
-#             state["medical_entities"],
-#             state["risk_assessment"]
-#         )
-#         return state
-
-#     # ---------- PUBLIC ENTRY ----------
-
-#     async def run(self, patient_id: str, text: str):
-#         state = {
-#             "patient_id": patient_id,
-#             "text_input": text,
-#             "processing_start_time": datetime.now().timestamp()
-#         }
-#         return await self.workflow.ainvoke(state)
+import json
 
 
 from datetime import datetime
@@ -90,14 +21,20 @@ from langgraph.graph import StateGraph, START, END
 
 from .state import MedicalConsultationState
 
-
-
 class DoctorLittleAgent:
 
     def __init__(self):
         self.tools = DoctorLittleTools(self)
         self.workflow = build_workflow(self)
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        self.templates = {
+            "SOAP": {
+                "name": "SOAP Note",
+                "sections": ["subjective", "objective", "assessment", "plan"]
+            }
+        }
+        self.agent_id = "doctor-little-medical-agent"
+        self.agent_version = "2.0.0"
 
     async def _voice_processing_node(self, state: MedicalConsultationState):
         if state.get("audio_data"):
@@ -137,24 +74,44 @@ class DoctorLittleAgent:
         return state
 
 
+    # async def _evidence_search_node(self, state):
+    #     if state.get("medical_entities"):
+    #         query_parts = []
+
+    #         if state["medical_entities"].get("chief_complaint"):
+    #             query_parts.append(state["medical_entities"]["chief_complaint"])
+
+    #         symptoms = state["medical_entities"].get("symptoms", [])
+    #         if isinstance(symptoms, list):
+    #             query_parts.extend(symptoms[:3])
+
+    #         query = " ".join(query_parts)
+
+    #         if query:
+    #             result = await self.search_clinical_evidence_internal(query)
+    #             state["clinical_evidence"] = result.get("results", [])
+
+    #     return state
     async def _evidence_search_node(self, state):
-        if state.get("medical_entities"):
-            query_parts = []
+        entities = state.get("medical_entities") or {}
+        query_parts = []
 
-            if state["medical_entities"].get("chief_complaint"):
-                query_parts.append(state["medical_entities"]["chief_complaint"])
+        cc = entities.get("chief_complaint")
+        if isinstance(cc, str):
+            query_parts.append(cc)
 
-            symptoms = state["medical_entities"].get("symptoms", [])
-            if isinstance(symptoms, list):
-                query_parts.extend(symptoms[:3])
+        symptoms = entities.get("symptoms", [])
+        if isinstance(symptoms, list):
+            query_parts.extend([s for s in symptoms if isinstance(s, str)])
 
-            query = " ".join(query_parts)
+        query = " ".join(query_parts)
 
-            if query:
-                result = await self.search_clinical_evidence_internal(query)
-                state["clinical_evidence"] = result.get("results", [])
+        if query:
+            result = await self.search_clinical_evidence_internal(query)
+            state["clinical_evidence"] = result.get("results", [])
 
         return state
+
 
 
     async def _risk_assessment_node(self, state):
@@ -249,6 +206,116 @@ class DoctorLittleAgent:
 
    
     import json
+    import re
+    import json
+
+    def _extract_json_from_llm(self, text: str) -> dict:
+        """
+        Safely extracts the first JSON object from an LLM response.
+        Handles markdown, explanations, and extra text.
+        """
+
+        # Try fenced ```json block first
+        fence_match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if fence_match:
+            return json.loads(fence_match.group(1))
+
+        # Fallback: first {...} block
+        brace_match = re.search(r"(\{.*\})", text, re.DOTALL)
+        if brace_match:
+            return json.loads(brace_match.group(1))
+
+        raise ValueError("No valid JSON found in LLM response")
+    
+    # def _normalize_entities(self, entities: dict) -> dict:
+    #     """
+    #     Converts LLM structured output into internal flat schema.
+    #     """
+
+    #     def unwrap(field):
+    #         if isinstance(field, dict) and "value" in field:
+    #             return field["value"]
+    #         return field
+
+    #     normalized = {}
+
+    #     for key, value in entities.items():
+    #         normalized[key] = unwrap(value)
+
+    #     # Fix pain assessment naming
+    #     pain = normalized.get("pain_assessment", {})
+    #     if isinstance(pain, dict):
+    #         if "intensity" in pain:
+    #             pain["severity"] = pain.pop("intensity")
+
+    #     return normalized
+    def _canonicalize_entities(self, raw: dict) -> dict:
+        """
+        Convert LLM entity output into strict internal schema.
+        Ensures downstream safety.
+        """
+
+        def unwrap(v):
+            if isinstance(v, dict) and "value" in v:
+                return v["value"]
+            return v
+
+        entities = {}
+
+        # -------- Scalars --------
+        cc = unwrap(raw.get("chief_complaint"))
+        entities["chief_complaint"] = cc if isinstance(cc, str) else "not specified"
+
+        entities["timeline"] = unwrap(raw.get("timeline")) or "not specified"
+
+        # -------- Lists --------
+        symptoms = unwrap(raw.get("symptoms"))
+        if isinstance(symptoms, str):
+            symptoms = [symptoms]
+        entities["symptoms"] = symptoms if isinstance(symptoms, list) else []
+
+        red_flags = unwrap(raw.get("red_flags"))
+        if isinstance(red_flags, str):
+            red_flags = [red_flags]
+        entities["red_flags"] = red_flags if isinstance(red_flags, list) else []
+
+        # -------- Pain assessment --------
+        pain_raw = unwrap(raw.get("pain_assessment"))
+        pain = {}
+
+        if isinstance(pain_raw, dict):
+            if "intensity" in pain_raw:
+                pain["severity"] = int(pain_raw["intensity"])
+            elif "severity" in pain_raw:
+                pain["severity"] = int(pain_raw["severity"])
+            pain["scale"] = pain_raw.get("scale", "out of 10")
+
+        elif isinstance(pain_raw, str):
+            import re
+            m = re.search(r"(\d+)", pain_raw)
+            if m:
+                pain["severity"] = int(m.group(1))
+                pain["scale"] = "out of 10"
+
+        entities["pain_assessment"] = pain
+
+        # -------- Defaults --------
+        for key in [
+            "medications", "allergies", "medical_history",
+            "vital_signs", "physical_findings",
+            "risk_factors", "social_history", "family_history"
+        ]:
+            entities[key] = unwrap(raw.get(key)) or "not specified"
+
+        # -------- Auto red-flag logic --------
+        if isinstance(entities["chief_complaint"], str):
+            if "chest pain" in entities["chief_complaint"].lower():
+                entities["red_flags"].append("chest pain")
+
+        return entities
+
+
+
 
     async def extract_medical_entities_internal(self, text: str) -> Dict:
         """
@@ -260,20 +327,24 @@ class DoctorLittleAgent:
 
         response = await self.llm.ainvoke(prompt)
 
-        raw = response.content.strip()
+        # raw = response.content.strip()
 
-        # 🔥 FIX: CLEAN ```json ``` BLOCKS
-        if raw.startswith("```"):
-            raw = raw.replace("```json", "").replace("```", "").strip()
+        # # 🔥 FIX: CLEAN ```json ``` BLOCKS
+        # if raw.startswith("```"):
+        #     raw = raw.replace("```json", "").replace("```", "").strip()
 
         try:
-            entities = json.loads(raw)
+            raw_entities = self._extract_json_from_llm(response.content)
+            entities = self._canonicalize_entities(raw_entities)
         except Exception:
-            entities = {
-                "chief_complaint": "not specified",
-                "symptoms": [],
-                "pain_assessment": {},
-            }
+            entities = self._canonicalize_entities(
+            self._fallback_entity_extraction(text)
+            )
+                    # entities = {
+            #     "chief_complaint": "not specified",
+            #     "symptoms": [],
+            #     "pain_assessment": {},
+            # }
 
         entities.update({
             "extraction_confidence": 0.9,
@@ -292,9 +363,9 @@ class DoctorLittleAgent:
         try:
             query_lower = query.lower()
             relevant_guidelines = []
-            
+            medical_guidelines = self._load_medical_guidelines()
             # Search through loaded guidelines
-            for guideline in self.medical_guidelines:
+            for guideline in medical_guidelines:
                 relevance_score = 0.0
                 
                 # Check title relevance
@@ -349,7 +420,8 @@ class DoctorLittleAgent:
             # Assess red flags
             red_flags = entities.get("red_flags", [])
             if isinstance(red_flags, list):
-                risk_factors["red_flags"] = min(len(red_flags) * 2, 10)
+               risk_factors["red_flags"] = len(red_flags) * 2
+
             
             # Assess pain severity
             pain_info = entities.get("pain_assessment", {})
@@ -403,6 +475,337 @@ class DoctorLittleAgent:
                 "risk_score": 5.0,
                 "urgency_level": "medium"
             }
+            
+    def _get_image_analysis_prompt(self, analysis_type: str) -> str:
+        """Get appropriate prompt for medical image analysis"""
+        base_prompt = """
+        You are a medical AI assistant specializing in image analysis. Analyze this medical image and provide:
+
+        1. **Visual Description**: What you observe in the image
+        2. **Anatomical Structures**: Identify visible anatomical structures
+        3. **Abnormal Findings**: Note any abnormalities, lesions, or concerning features
+        4. **Clinical Significance**: Potential clinical implications
+        5. **Recommendations**: Suggested follow-up or additional imaging
+        6. **Confidence Level**: Your confidence in the analysis (0-100%)
+
+        Important: This is for informational purposes only and should not replace professional medical diagnosis.
+        """
+        
+        if analysis_type == "dermatology":
+            return base_prompt + "\nFocus on skin lesions, color changes, texture, and dermatological patterns."
+        elif analysis_type == "radiology":
+            return base_prompt + "\nFocus on radiological findings, contrast, and anatomical abnormalities."
+        else:
+            return base_prompt + "\nProvide a general medical assessment of the image."
+
+    def _parse_image_analysis(self, analysis_text: str, analysis_type: str) -> Dict:
+        """Parse structured analysis from GPT-4 Vision response"""
+        return {
+            "raw_analysis": analysis_text,
+            "analysis_type": analysis_type,
+            "findings": "Parsed findings would go here",
+            "recommendations": "Parsed recommendations would go here"
+        }
+
+    def _fallback_entity_extraction(self, text: str) -> Dict:
+        text_lower = text.lower()
+
+        entities = {
+            "chief_complaint": "not specified",
+            "symptoms": [],
+            "pain_assessment": {},
+            "red_flags": [],
+            "extraction_confidence": 0.7
+        }
+
+        if "chest pain" in text_lower:
+            entities["chief_complaint"] = "chest pain"
+            entities["symptoms"].append("chest pain")
+
+        import re
+        pain_match = re.search(r'(\d+)\s*(out of|/)\s*10', text_lower)
+        if pain_match:
+            entities["pain_assessment"]["severity"] = int(pain_match.group(1))
+
+        if "left arm" in text_lower:
+            entities["pain_assessment"]["radiation"] = "left arm"
+            entities["red_flags"].append("pain radiating to left arm")
+
+        return entities
+
+
+    def _generate_risk_recommendations(self, urgency: UrgencyLevel, entities: Dict, evidence: Dict) -> List[str]:
+        """Generate clinical recommendations based on risk level"""
+        recommendations = []
+        
+        if urgency == UrgencyLevel.CRITICAL:
+            recommendations.extend([
+                "Immediate medical attention required",
+                "Consider emergency department evaluation",
+                "Vital signs monitoring",
+                "Prepare for potential interventions"
+            ])
+        elif urgency == UrgencyLevel.HIGH:
+            recommendations.extend([
+                "Urgent medical evaluation within 1 hour",
+                "Serial vital signs",
+                "Consider diagnostic testing"
+            ])
+        elif urgency == UrgencyLevel.MEDIUM:
+            recommendations.extend([
+                "Medical evaluation within 24 hours",
+                "Monitor symptoms",
+                "Return if symptoms worsen"
+            ])
+        else:
+            recommendations.extend([
+                "Routine follow-up as appropriate",
+                "Monitor symptoms",
+                "Lifestyle modifications as indicated"
+            ])
+        
+        return recommendations
+
+    def _generate_section(self, section: str, entities: Dict, risk_assessment: Dict) -> str:
+        """Generate specific documentation section"""
+        if section == "subjective":
+            return self._generate_subjective_section(entities)
+        elif section == "objective":
+            return self._generate_objective_section(entities)
+        elif section == "assessment":
+            return self._generate_assessment_section(entities, risk_assessment)
+        elif section == "plan":
+            return self._generate_plan_section(risk_assessment)
+        elif section == "chief_complaint":
+            return entities.get("chief_complaint", "Not specified")
+        else:
+            return f"[{section.upper()}: To be completed by clinician]"
+
+    def _generate_subjective_section(self, entities: Dict) -> str:
+        """Generate SOAP Subjective section"""
+        parts = []
+        
+        if entities.get("chief_complaint"):
+            parts.append(f"Chief complaint: {entities['chief_complaint']}")
+        
+        symptoms = entities.get("symptoms", [])
+        if symptoms:
+            parts.append(f"Associated symptoms: {', '.join(symptoms)}")
+        
+        pain = entities.get("pain_assessment", {})
+        if isinstance(pain, dict) and pain.get("severity"):
+            parts.append(f"Pain severity: {pain['severity']}/10")
+
+        
+        return ". ".join(parts) + "." if parts else "Patient history to be obtained."
+
+    def _generate_objective_section(self, entities: Dict) -> str:
+        """Generate SOAP Objective section"""
+        parts = []
+        
+        vitals = entities.get("vital_signs", {})
+        # if vitals:
+        #     vital_strings = [f"{k}: {v}" for k, v in vitals.items()]
+        #     parts.append(f"Vital signs: {', '.join(vital_strings)}")
+        
+        # physical = entities.get("physical_findings", [])
+        # if physical:
+        #     parts.append(f"Physical exam: {', '.join(physical)}")
+        
+        # return ". ".join(parts) + "." if parts else "Physical examination to be performed."
+        if isinstance(vitals, dict) and vitals:
+            vital_strings = [f"{k}: {v}" for k, v in vitals.items()]
+            parts.append(f"Vital signs: {', '.join(vital_strings)}")
+
+        physical = entities.get("physical_findings")
+
+        if isinstance(physical, list) and physical:
+            parts.append(f"Physical exam: {', '.join(physical)}")
+
+        return ". ".join(parts) + "." if parts else "Physical examination to be performed."
+
+    def _generate_assessment_section(self, entities: Dict, risk_assessment: Dict) -> str:
+        """Generate SOAP Assessment section"""
+        parts = []
+        
+        if entities.get("chief_complaint"):
+            parts.append(f"Patient presenting with {entities['chief_complaint']}")
+        
+        if risk_assessment.get("urgency_level"):
+            urgency = risk_assessment["urgency_level"]
+            risk_score = risk_assessment.get("risk_score", 0)
+            parts.append(f"Clinical risk assessment: {urgency} urgency (score: {risk_score}/10)")
+        
+        return ". ".join(parts) + "." if parts else "Clinical assessment pending."
+
+    def _generate_plan_section(self, risk_assessment: Dict) -> str:
+        """Generate SOAP Plan section"""
+        recommendations = risk_assessment.get("recommendations", [])
+        if recommendations:
+            return "Plan: " + "; ".join(recommendations) + "."
+        return "Treatment plan to be determined."
+
+    def _format_clinical_note(self, sections: Dict, template_name: str) -> str:
+        """Format clinical note as text"""
+        lines = [
+            f"{template_name}",
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 60,
+            ""
+        ]
+        
+        for section_key, content in sections.items():
+            section_name = section_key.replace("_", " ").upper()
+            lines.extend([
+                f"{section_name}:",
+                content,
+                ""
+            ])
+        
+        return "\n".join(lines)
+
+    def _calculate_documentation_quality(self, sections: Dict, entities: Dict) -> Dict:
+        """Calculate documentation quality metrics"""
+        completed_sections = len([s for s in sections.values() if s and not s.startswith("[")])
+        total_sections = len(sections)
+        
+        completeness = (completed_sections / total_sections) * 100 if total_sections > 0 else 0
+        
+        # Check for key clinical elements
+        key_elements = ["chief_complaint", "symptoms", "assessment"]
+        elements_present = sum(1 for elem in key_elements if entities.get(elem))
+        clinical_accuracy = (elements_present / len(key_elements)) * 100
+        
+        overall_score = (completeness * 0.6) + (clinical_accuracy * 0.4)
+        
+        return {
+            "completeness": round(completeness, 1),
+            "clinical_accuracy": round(clinical_accuracy, 1),
+            "overall_score": round(overall_score, 1),
+            "completed_sections": completed_sections,
+            "total_sections": total_sections
+        }
+
+    def _suggest_icd10_codes(self, entities: Dict) -> List[Dict]:
+        """Suggest relevant ICD-10 codes based on extracted entities"""
+        suggestions = []
+        
+        symptoms = entities.get("symptoms", [])
+        chief_complaint = entities.get("chief_complaint", "").lower()
+        icd10_codes=self._load_icd10_codes()
+        for code_info in icd10_codes:
+            score = 0.0
+            
+            # Check against chief complaint
+            if any(word in chief_complaint for word in code_info["description"].lower().split()):
+                score += 0.8
+            
+            # Check against symptoms
+            for symptom in symptoms:
+                if isinstance(symptom, str) and any(word in symptom.lower() for word in code_info["description"].lower().split()):
+                    score += 0.6
+            
+            if score > 0.3:
+                suggestions.append({
+                    **code_info,
+                    "confidence": min(score, 1.0),
+                    "rationale": f"Matches clinical presentation"
+                })
+        
+        return sorted(suggestions, key=lambda x: x["confidence"], reverse=True)[:5]
+    
+    
+    def _load_medical_guidelines(self) -> List[Dict]:
+        """Load clinical guidelines and evidence base"""
+        return [
+            {
+                "id": "chest-pain-acs",
+                "title": "Acute Coronary Syndrome Guidelines",
+                "category": "cardiology",
+                "keywords": ["chest pain", "acs", "heart attack", "myocardial infarction"],
+                "recommendations": [
+                    "Immediate 12-lead ECG within 10 minutes",
+                    "Serial cardiac troponins at 0, 3, 6 hours",
+                    "Aspirin 325mg immediately unless contraindicated",
+                    "HEART score for risk stratification"
+                ],
+                "red_flags": ["crushing chest pain", "radiation to arm/jaw", "diaphoresis", "nausea"],
+                "evidence_level": "A"
+            },
+            {
+                "id": "respiratory-distress",
+                "title": "Acute Respiratory Distress Protocol",
+                "category": "pulmonology",
+                "keywords": ["shortness of breath", "dyspnea", "respiratory failure"],
+                "recommendations": [
+                    "Pulse oximetry immediately",
+                    "Chest X-ray within 30 minutes",
+                    "ABG if oxygen saturation <92%",
+                    "Consider PE protocol if indicated"
+                ],
+                "red_flags": ["severe dyspnea", "cyanosis", "altered mental status"],
+                "evidence_level": "A"
+            }
+        ]
+    
+    def _load_icd10_codes(self) -> List[Dict]:
+        """Load ICD-10 diagnostic codes"""
+        return [
+            {"code": "R06.02", "description": "Shortness of breath", "category": "respiratory"},
+            {"code": "R07.89", "description": "Other chest pain", "category": "cardiovascular"},
+            {"code": "R51.9", "description": "Headache, unspecified", "category": "neurological"},
+            {"code": "R10.9", "description": "Unspecified abdominal pain", "category": "gastrointestinal"},
+            {"code": "I20.9", "description": "Angina pectoris, unspecified", "category": "cardiovascular"}
+        ]
+        
+    def _load_clinical_templates(self) -> Dict:
+        """Load clinical documentation templates"""
+        return {
+            "SOAP": {
+                "name": "SOAP Note",
+                "sections": ["subjective", "objective", "assessment", "plan"],
+                "description": "Standard clinical documentation format"
+            },
+            "H_AND_P": {
+                "name": "History & Physical",
+                "sections": ["chief_complaint", "hpi", "pmh", "medications", "allergies", 
+                           "social_history", "family_history", "ros", "physical_exam", "assessment_plan"],
+                "description": "Comprehensive patient assessment"
+            },
+            "EMERGENCY": {
+                "name": "Emergency Assessment",
+                "sections": ["chief_complaint", "vital_signs", "primary_survey", "secondary_assessment", 
+                           "diagnostics", "treatment", "disposition"],
+                "description": "Emergency department documentation"
+            }
+        }
+        
+    def get_agent_info(self) -> Dict:
+        """Get agent information and capabilities"""
+        return {
+            "agent_id": self.agent_id,
+            "agent_name": "Doctor Little - AI Medical Agent",
+            "version": self.agent_version,
+            "description": "Comprehensive AI medical agent providing voice transcription, image analysis, clinical reasoning, and documentation generation",
+            "capabilities": [
+                "voice_processing",
+                "medical_image_analysis", 
+                "clinical_entity_extraction",
+                "evidence_based_medicine",
+                "clinical_risk_assessment",
+                "structured_documentation"
+            ],
+            "supported_templates": list(self.templates.keys()),
+            "consultation_types": ["general", "emergency", "follow_up"],
+            "input_modalities": ["voice", "text", "image"],
+            "output_formats": ["SOAP", "H_AND_P", "EMERGENCY"],
+            "clinical_specialties": [
+                "general_medicine",
+                "emergency_medicine", 
+                "internal_medicine",
+                "family_medicine"
+            ]
+        }
 
     # ---------------------------
     # SINGLE ENTRY POINT (LOCKED)
@@ -441,7 +844,8 @@ class DoctorLittleAgent:
                         "average_confidence": 0.0,
                         "components_processed": 0
                         },
-            "messages": []
+            "messages": [],
+            "agent_version": self.agent_version
         }
 
         final_state = await self.workflow.ainvoke(initial_state)
