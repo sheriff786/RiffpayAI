@@ -8,7 +8,11 @@ if not OPENAI_KEY:
     raise RuntimeError("OPENAI_API_KEY not found in .env")
 
 from fastapi import FastAPI
+# from app.api.consult_old import router as consult_router
 from app.api.consult import router as consult_router
+from app.agents.bootstrap import load_agents
+
+load_agents()   # 🔥 IMPORTANT: before MCP or API usage
 
 app = FastAPI(
     title="Doctor Little Backend",
@@ -29,7 +33,7 @@ def root():
 # )
 
 
-from app.api.consult import router as consult_router
+# from backend.app.api.consult_old import router as consult_router
 
 app = FastAPI(title="Doctor Little API")
 

@@ -6,6 +6,8 @@ from typing import Dict, List
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 import os
+
+from app.agents.registry import AgentRegistry
 from .state import MedicalConsultationState
 from .state import MedicalConsultationState, UrgencyLevel
 from .workflow import build_workflow
@@ -20,10 +22,16 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 
 from .state import MedicalConsultationState
+from app.agents.base import BaseAgent
 
-class DoctorLittleAgent:
+class DoctorLittleAgent(BaseAgent):
+    name = "doctor-little"
+    priority = 10          # runs first
+    can_override = False
+
 
     def __init__(self):
+        AgentRegistry().register(self)
         self.tools = DoctorLittleTools(self)
         self.workflow = build_workflow(self)
         self.llm = None
@@ -830,6 +838,7 @@ class DoctorLittleAgent:
     # ---------------------------
     # SINGLE ENTRY POINT (LOCKED)
     # ---------------------------
+    from langsmith import traceable
 
     async def process_consultation(
         self,
@@ -870,4 +879,29 @@ class DoctorLittleAgent:
 
         final_state = await self.workflow.ainvoke(initial_state)
         return final_state
+        # -------------------------------------------------
+    # BaseAgent compatibility adapter (DO NOT CHANGE)
+    # -------------------------------------------------
+    @traceable(name="DoctorLittleAgent",run_type="chain")
+    async def run(self, state: dict) -> dict:
+        """
+        Adapter method required by BaseAgent.
+        This does NOT change internal logic.
+        """
+
+        result = await self.process_consultation(
+            patient_id=state.get("patient_id", "UNKNOWN"),
+            text_input=state.get("text"),
+            template_type=state.get("template_type", "SOAP"),
+            consultation_type=state.get("consultation_type", "general"),
+        )
+
+        # Normalize output for registry / router
+        return {
+            "mode": result.get("consultation_type", "general"),
+            "entities": result.get("medical_entities"),
+            "risk": result.get("risk_assessment"),
+            "note": result.get("structured_note"),
+            "agent_metrics": result.get("agent_metrics"),
+        }
 

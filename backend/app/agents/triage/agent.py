@@ -1,17 +1,38 @@
 import json
 from typing import Dict
 from langchain_openai import ChatOpenAI
+from langsmith import traceable
 from .prompts import TRIAGE_PROMPT
+from app.agents.registry import AgentRegistry
+import os
+
 
 class TriageAgent:
     """
     LLM-driven clinical triage agent with safety fallback.
     """
+    name = "triage"
+    priority = 20
+    can_override = True
 
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        AgentRegistry().register(self)
+        self.llm = None   # 🔥 DO NOT initialize here
 
-    async def run(self, entities: Dict, risk: Dict) -> Dict:
+    def _get_llm(self):
+        if self.llm is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY not set")
+
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0,
+                api_key=api_key
+            )
+        return self.llm
+
+    async def triage(self, entities: Dict, risk: Dict) -> Dict:
         try:
             prompt = TRIAGE_PROMPT.format(
                 chief_complaint=entities.get("chief_complaint"),
@@ -20,7 +41,7 @@ class TriageAgent:
                 risk_score=risk.get("risk_score"),
                 urgency_level=risk.get("urgency_level")
             )
-
+            llm = self._get_llm()
             response = await self.llm.ainvoke(prompt)
             raw = response.content.strip()
 
@@ -46,5 +67,23 @@ class TriageAgent:
             "consultation_type": consultation_type,
             "recommended_action": "Clinical evaluation recommended",
             "escalation_required": consultation_type in ["emergency", "urgent"],
-            "confidence": 0.6
+            "confidence": 0.6,
+            "fall_back": True
+        }
+    @traceable(name="TriageAgent",run_type="chain")    
+    async def run(self, state: dict) -> dict:
+        """
+        BaseAgent adapter — does NOT change triage logic
+        """
+
+        entities = state.get("entities", {})
+        risk = state.get("risk", {})
+
+        triage_result = await self.triage(
+            entities=entities,
+            risk=risk
+        )
+
+        return {
+            "triage": triage_result
         }

@@ -1,17 +1,37 @@
 import json
 from typing import Dict
 from langchain_openai import ChatOpenAI
+from langsmith import traceable
+from typer import prompt
 from .prompts import FOLLOW_UP_PROMPT
-
+from app.agents.registry import AgentRegistry
+import os
 class FollowUpAgent:
     """
     Patient-facing follow-up communication agent.
     """
+    name = "follow-up"
+    priority = 40
+    can_override = False
 
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+        AgentRegistry().register(self)
+        self.llm = None   # 🔥 DO NOT initialize here
 
-    async def run(
+    def _get_llm(self):
+        if self.llm is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY not set")
+
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0,
+                api_key=api_key
+            )
+        return self.llm
+   
+    async def generate_follow_up(
         self,
         entities: Dict,
         risk: Dict,
@@ -25,7 +45,8 @@ class FollowUpAgent:
                 plan=soap_note["sections"].get("plan")
             )
 
-            response = await self.llm.ainvoke(prompt)
+            llm = self._get_llm()
+            response = await llm.ainvoke(prompt)
             raw = response.content.strip()
 
             return json.loads(raw)
@@ -64,5 +85,21 @@ class FollowUpAgent:
             "message": message,
             "follow_up_timing": follow_up,
             "seek_help_if": seek_help,
-            "confidence": 0.6
+            "confidence": 0.6,
+            "fall_back": True
+        }
+    @traceable(name="FollowUpAgent",run_type="chain")
+    async def run(self, state: dict) -> dict:
+        """
+        BaseAgent adapter — patient-facing messaging
+        """
+
+        follow_up = await self.generate_follow_up(
+            entities=state.get("entities", {}),
+            risk=state.get("risk", {}),
+            soap_note=state.get("note", {})
+        )
+
+        return {
+            "follow_up": follow_up
         }

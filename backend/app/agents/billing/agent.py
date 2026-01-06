@@ -1,17 +1,37 @@
 import json
 from typing import Dict, List
 from langchain_openai import ChatOpenAI
+from langsmith import traceable
 from .prompts import BILLING_PROMPT
-
+import os
+from app.agents.registry import AgentRegistry
 class BillingAgent:
     """
     LLM-guided medical billing agent with deterministic fallback.
+    
     """
+    name = "billing"
+    priority = 30
+    can_override = False
 
     def __init__(self):
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        AgentRegistry().register(self)
+        self.llm = None   # 🔥 DO NOT initialize here
 
-    async def run(
+    def _get_llm(self):
+        if self.llm is None:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY not set")
+
+            self.llm = ChatOpenAI(
+                model="gpt-4o-mini",
+                temperature=0,
+                api_key=api_key
+            )
+        return self.llm
+
+    async def generate_billing(
         self,
         triage: Dict,
         risk: Dict,
@@ -25,13 +45,13 @@ class BillingAgent:
                 risk_score=risk.get("risk_score"),
                 icd_codes=icd_codes
             )
-
+            llm = self._get_llm()
             response = await self.llm.ainvoke(prompt)
             raw = response.content.strip()
 
             return json.loads(raw)
 
-        except Exception:
+        except Exception as e:
             return self._fallback(triage, risk)
 
     def _fallback(self, triage: Dict, risk: Dict) -> Dict:
@@ -56,5 +76,21 @@ class BillingAgent:
             "billing_level": level,
             "billing_reason": "Derived from triage and risk level",
             "estimated_cost_range": cost,
-            "confidence": 0.6
+            "confidence": 0.6,
+            "fall_back": True
+        }
+    @traceable(name="BillingAgent",run_type="chain")
+    async def run(self, state: dict) -> dict:
+        """
+        BaseAgent adapter — billing only
+        """
+
+        billing = await self.generate_billing(
+            triage=state.get("triage", {}),
+            risk=state.get("risk", {}),
+            icd10_suggestions=state.get("note", {}).get("icd10_suggestions", [])
+        )
+
+        return {
+            "billing": billing
         }
